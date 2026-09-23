@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fabula</title>
+<style>
+  :root { color-scheme: light dark; --bg: #f6f4ef; --panel: #fffdf9; --text: #26231f; --muted: #7a746b; --border: #ddd6ca; --accent: #8a4b2a; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #1b1a18; --panel: #242220; --text: #e9e4db; --muted: #9a9387; --border: #3a3631; --accent: #c9804f; } }
+  * { box-sizing: border-box; }
+  body { margin: 0; height: 100vh; display: flex; flex-direction: column; font: 14px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--border); }
+  h1 { margin: 0 12px 0 0; font: 600 20px Georgia, serif; }
+  #status { margin-left: auto; color: var(--muted); }
+  main { flex: 1; min-height: 0; display: grid; grid-template-columns: 380px 1fr; }
+  aside { display: flex; flex-direction: column; gap: 10px; padding: 16px; overflow: auto; border-right: 1px solid var(--border); }
+  section { display: flex; flex-direction: column; gap: 10px; padding: 16px; min-height: 0; }
+  label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+  input, select, textarea, button { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 6px 9px; }
+  textarea { resize: vertical; }
+  #text { flex: 1; resize: none; padding: 20px 28px; font: 17px/1.75 Georgia, serif; }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .45; cursor: default; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
+  .row > label { flex: 1; min-width: 120px; }
+  dialog { width: min(820px, 95vw); padding: 20px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 10px; }
+  dialog form { display: flex; flex-direction: column; gap: 10px; }
+  @media (max-width: 820px) { main { grid-template-columns: 1fr; overflow: auto; } aside { border-right: 0; } #text { min-height: 70vh; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Fabula</h1>
+  <select id="projects" aria-label="Project"></select>
+  <button id="newProject">+ New text</button>
+  <button id="deleteProject">Delete</button>
+  <span id="status">Connecting…</span>
+</header>
+<main>
+  <aside>
+    <label>Title <input id="name"></label>
+    <div class="row">
+      <label>Genre <input id="genre" placeholder="e.g. dark fantasy"></label>
+      <label>Language
+        <select id="language"><option value="English">English</option><option value="Czech">Czech</option></select>
+      </label>
+    </div>
+    <div class="row">
+      <label>Style <select id="style"></select></label>
+      <button id="editStyle">Edit</button>
+      <button id="newStyle">+ New</button>
+    </div>
+    <label>What it should be about
+      <textarea id="premise" rows="7" placeholder="Characters, setting, plot, mood, what should happen…"></textarea>
+    </label>
+    <button id="makeOutline" data-ai>Suggest outline</button>
+    <label>Outline (edit it freely, the AI follows it)
+      <textarea id="outline" rows="14"></textarea>
+    </label>
+  </aside>
+  <section>
+    <textarea id="text" aria-label="Text" placeholder="Your text appears here. Click “Continue”, or start writing yourself – the AI picks up where you stop."></textarea>
+    <div class="row">
+      <label>Instruction (optional) <input id="instruction" placeholder="what should happen next / how to rewrite the selection"></label>
+      <label style="flex: 0 0 110px; min-width: 0">Length (tokens) <input id="maxTokens" type="number" min="100" max="4000" step="100"></label>
+      <button id="continue" class="primary" data-ai>Continue</button>
+      <button id="rewrite" data-ai>Rewrite selection</button>
+      <button id="undo">Undo</button>
+      <button id="stop" disabled>Stop</button>
+    </div>
+  </section>
+</main>
+
+<dialog id="styleDialog">
+  <form method="dialog">
+    <label>Style name <input id="styleName"></label>
+    <label>Samples (paste excerpts by the author whose style you want to imitate)
+      <textarea id="styleSamples" rows="12"></textarea>
+    </label>
+    <button type="button" id="analyzeStyle" data-ai>Analyze style</button>
+    <label>Style description (sent to the AI with every request, edit freely)
+      <textarea id="styleDescription" rows="9"></textarea>
+    </label>
+    <div class="row">
+      <button type="button" id="saveStyle" class="primary">Save</button>
+      <button type="button" id="deleteStyle">Delete</button>
+      <button>Close</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+const KOBOLD = "http://localhost:5001";
+const SAMPLERS = { temperature: 0.9, min_p: 0.05, dry_multiplier: 0.8, dry_base: 1.75, dry_allowed_length: 2 };
+// ponytail: char-based context budget (~8k tokens); count tokens via /api/extra/tokencount if it ever overflows
+const TEXT_BUDGET = 24000;
+const DEFAULTS = { name: "New text", genre: "", language: "English", style: "", premise: "", outline: "", instruction: "", maxTokens: "1200", text: "" };
+const FIELDS = Object.keys(DEFAULTS);
+
+const $ = id => document.getElementById(id);
+const api = (path, opts) => fetch("/api/" + path, opts).then(r => r.status === 200 ? r.json() : null);
+const put = (path, data) => api(path, { method: "PUT", body: JSON.stringify(data) });
+const newId = () => Date.now().toString(36);
+
+let projectId, dirty = false, saveTimer, undoState, controller, editingStyle, koboldStatus = "";
+
+// ---------- projects ----------
+const readProject = () => Object.fromEntries(FIELDS.map(f => [f, $(f).value]));
+const fillProject = p => FIELDS.forEach(f => $(f).value = p[f] ?? DEFAULTS[f]);
+
+function save() {
+  dirty = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flush, 800);
+}
+
+async function flush() {
+  clearTimeout(saveTimer);
+  if (!dirty) return;
+  dirty = false;
+  await put("projects/" + projectId, readProject());
+  await refreshProjects();
+}
+
+async function refreshProjects() {
+  const list = await api("projects");
+  $("projects").replaceChildren(...list.map(p => new Option(p.name, p.id)));
+  $("projects").value = projectId;
+  return list;
+}
+
+async function openProject(id) {
+  await flush();
+  projectId = id;
+  fillProject(await api("projects/" + id));
+  undoState = null;
+  await refreshProjects();
+}
+
+async function newProject() {
+  await flush();
+  projectId = newId();
+  fillProject(DEFAULTS);
+  dirty = true;
+  await flush();
+}
+
+$("projects").onchange = e => openProject(e.target.value);
+$("newProject").onclick = newProject;
+$("deleteProject").onclick = async () => {
+  if (!confirm(`Really delete “${$("name").value}”?`)) return;
+  clearTimeout(saveTimer);
+  dirty = false;
+  await api("projects/" + projectId, { method: "DELETE" });
+  const list = await api("projects");
+  list.length ? openProject(list[0].id) : newProject();
+};
+document.querySelector("main").addEventListener("input", save);
+addEventListener("beforeunload", e => { if (dirty || controller) e.preventDefault(); });
+
+// ---------- styles ----------
+async function refreshStyles() {
+  const current = $("style").value;
+  const list = await api("styles");
+  $("style").replaceChildren(new Option("(no style)", ""), ...list.map(s => new Option(s.name, s.id)));
+  $("style").value = list.some(s => s.id === current) ? current : "";
+}
+
+async function openStyle(id) {
+  editingStyle = id ? await api("styles/" + id) : { id: newId(), name: "", samples: "", description: "" };
+  $("styleName").value = editingStyle.name;
+  $("styleSamples").value = editingStyle.samples;
+  $("styleDescription").value = editingStyle.description;
+  $("styleDialog").showModal();
+}
+
+$("editStyle").onclick = () => openStyle($("style").value);
+$("newStyle").onclick = () => openStyle(null);
+$("saveStyle").onclick = async () => {
+  const s = { id: editingStyle.id, name: $("styleName").value.trim() || "Untitled", samples: $("styleSamples").value, description: $("styleDescription").value };
+  await put("styles/" + s.id, s);
+  await refreshStyles();
+  $("style").value = s.id;
+  save();
+  $("styleDialog").close();
+};
+$("deleteStyle").onclick = async () => {
+  if (!confirm("Delete this style?")) return;
+  await api("styles/" + editingStyle.id, { method: "DELETE" });
+  await refreshStyles();
+  save();
+  $("styleDialog").close();
+};
+$("analyzeStyle").onclick = async () => {
+  const samples = $("styleSamples").value.trim();
+  if (!samples) return alert("Paste some sample text first.");
+  const prompt = `Analyze the writing style of the excerpts below and write a concise style guide (max 250 words, bullet points) that another writer could follow to imitate it. Cover: narrative perspective and tense, sentence length and rhythm, vocabulary and register, dialogue, density of description, pacing, tone and mood, and how intimate or explicit scenes are handled. Describe the style only – do not summarize the plot. Write the guide in English, as plain text without Markdown (use "-" for bullets).
+
+Excerpts:
+"""
+${samples.slice(0, 30000)}
+"""`;
+  await generate([{ role: "user", content: prompt }], 700, t => $("styleDescription").value = t);
+};
+
+// ---------- generation ----------
+function setBusy(busy) {
+  document.querySelectorAll("[data-ai]").forEach(b => b.disabled = busy);
+  $("stop").disabled = !busy;
+  $("status").textContent = busy ? "✍ Writing…" : koboldStatus;
+}
+
+async function generate(messages, maxTokens, onText) {
+  controller = new AbortController();
+  setBusy(true);
+  let out = "";
+  try {
+    const res = await fetch(KOBOLD + "/v1/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages, max_tokens: maxTokens, stream: true, ...SAMPLERS }),
+    });
+    if (!res.ok) throw new Error(`KoboldCpp returned ${res.status}`);
+    const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      const lines = (buf + value).split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (data === "[DONE]") continue;
+        out += JSON.parse(data).choices[0]?.delta?.content ?? "";
+        onText(out);
+      }
+    }
+  } catch (e) {
+    if (e.name !== "AbortError") alert("Generation failed: " + e.message + "\n\nIs KoboldCpp running (start.bat)?");
+  } finally {
+    controller = null;
+    setBusy(false);
+  }
+  return out;
+}
+
+$("stop").onclick = () => {
+  controller?.abort();
+  fetch(KOBOLD + "/api/extra/abort", { method: "POST" });
+};
+
+async function systemPrompt(p) {
+  let sys = `You are a skilled novelist writing uncensored fiction for an adult reader. Any content the story calls for is allowed; never refuse, moralize, or add disclaimers or notes. When the story calls for sex or violence, depict it explicitly and in full detail – no fading to black, no skipping ahead, no softening. Sexual content never involves minors. Write vivid, concrete prose: show, don't tell; varied sentence rhythm; natural dialogue; avoid clichés. Always write in ${p.language}.`;
+  const style = p.style && await api("styles/" + p.style);
+  if (style) {
+    sys += `\n\nImitate this writing style closely:\n${style.description}`;
+    if (style.samples) sys += `\n\nStyle sample (imitate the voice, never copy the content):\n"""\n${style.samples.slice(0, 2000)}\n"""`;
+  }
+  return sys;
+}
+
+const storyInfo = p => [
+  p.genre && `Genre: ${p.genre}`,
+  p.premise && `Premise: ${p.premise}`,
+  p.outline && `Outline:\n${p.outline}`,
+].filter(Boolean).join("\n\n");
+
+async function write(buildPrompt, maxTokens, onText) {
+  const p = readProject();
+  undoState = { text: p.text, outline: p.outline };
+  const messages = [{ role: "system", content: await systemPrompt(p) }, { role: "user", content: buildPrompt(p) }];
+  const out = await generate(messages, maxTokens(p), onText(p));
+  save();
+  return out;
+}
+
+$("makeOutline").onclick = () => {
+  if (!$("premise").value.trim()) return alert("First describe what the story should be about.");
+  write(
+    p => `${storyInfo({ ...p, outline: "" })}
+
+Create an outline for this story: a numbered list of chapters or scenes, each with 1–3 sentences on what happens. ${p.instruction && `Direction: ${p.instruction}. `}Output only the outline as plain text without Markdown, in ${p.language}.`,
+    () => 1500,
+    () => t => $("outline").value = t,
+  );
+};
+
+$("continue").onclick = async () => {
+  const el = $("text"), before = el.value;
+  const sep = !before || /\s$/.test(before) ? "" : /[.!?…"“”»]$/.test(before) ? "\n\n" : " ";
+  const out = await write(
+    p => {
+      const tail = p.text.slice(-TEXT_BUDGET);
+      const task = p.text.trim()
+        ? `Story so far${tail.length < p.text.length ? " (beginning omitted)" : ""}:\n"""\n${tail}\n"""\n\nContinue the story seamlessly from exactly where it ends. Write the next part (about one scene), following the outline. Do not repeat what was already written.`
+        : "Write the opening of the story, following the outline.";
+      return `${storyInfo(p)}\n\n${task}${p.instruction && `\nDirection for this part: ${p.instruction}`}\nOutput only the story text – no titles, summaries or comments.`;
+    },
+    p => +p.maxTokens || 1200,
+    () => t => { el.value = before + sep + t; el.scrollTop = el.scrollHeight; },
+  );
+  // drop a sentence cut off by the token limit or Stop; the next part would restart it anyway
+  const whole = out.match(/^[\s\S]*[.!?…]["“”»’]?(?=\s|$)/);
+  if (whole) { el.value = before + sep + whole[0]; save(); }
+};
+
+$("rewrite").onclick = () => {
+  const el = $("text"), a = el.selectionStart, b = el.selectionEnd;
+  if (a === b) return alert("First select the passage you want to rewrite.");
+  write(
+    p => `${storyInfo(p)}
+
+${a > 0 ? `Text right before the passage (context only):\n"""\n${p.text.slice(Math.max(0, a - 4000), a)}\n"""\n\n` : ""}Passage to rewrite (${p.text.slice(a, b).split(/\s+/).filter(Boolean).length} words):
+"""
+${p.text.slice(a, b)}
+"""
+
+Rewrite the passage. ${p.instruction ? `Instruction: ${p.instruction}` : "Make it more vivid and detailed."}
+Keep roughly the same length and number of paragraphs unless the instruction says otherwise. Rewrite only this passage – do not continue the story past its end.
+Output only the rewritten passage, no comments.`,
+    p => Math.max(+p.maxTokens || 1200, Math.ceil((b - a) / 2)),
+    p => t => el.value = p.text.slice(0, a) + t + p.text.slice(b),
+  );
+};
+
+$("undo").onclick = () => {
+  if (!undoState) return;
+  $("text").value = undoState.text;
+  $("outline").value = undoState.outline;
+  undoState = null;
+  save();
+};
+
+// ---------- start ----------
+async function checkKobold() {
+  if (controller) return;
+  try {
+    const r = await (await fetch(KOBOLD + "/api/v1/model")).json();
+    koboldStatus = "● " + r.result.replace(/^koboldcpp\//, "");
+  } catch {
+    koboldStatus = "○ KoboldCpp is not running – start start.bat (the model takes ~20 s to load)";
+  }
+  $("status").textContent = koboldStatus;
+}
+
+(async () => {
+  await refreshStyles();
+  const list = await api("projects");
+  list.length ? await openProject(list[0].id) : await newProject();
+  checkKobold();
+  setInterval(checkKobold, 5000);
+})();
+</script>
+</body>
+</html>
