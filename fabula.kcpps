@@ -1,0 +1,6 @@
+{
+  "usecuda": [],
+  "gpulayers": -1,
+  "contextsize": 16384,
+  "quantkv": "q8_0"
+}

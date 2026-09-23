@@ -11,7 +11,8 @@
   body { margin: 0; height: 100vh; display: flex; flex-direction: column; font: 14px/1.5 system-ui, sans-serif; background: var(--bg); color: var(--text); }
   header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--border); }
   h1 { margin: 0 12px 0 0; font: 600 20px Georgia, serif; }
-  #status { margin-left: auto; color: var(--muted); }
+  #model { margin-left: auto; max-width: 300px; }
+  #status { color: var(--muted); }
   main { flex: 1; min-height: 0; display: grid; grid-template-columns: 380px 1fr; }
   aside { display: flex; flex-direction: column; gap: 10px; padding: 16px; overflow: auto; border-right: 1px solid var(--border); }
   section { display: flex; flex-direction: column; gap: 10px; padding: 16px; min-height: 0; }
@@ -35,6 +36,7 @@
   <select id="projects" aria-label="Project"></select>
   <button id="newProject">+ New text</button>
   <button id="deleteProject">Delete</button>
+  <select id="model" aria-label="Model" title="AI model (any .gguf in the models folder)" data-ai></select>
   <span id="status">Connecting…</span>
 </header>
 <main>
@@ -103,7 +105,7 @@ const api = (path, opts) => fetch("/api/" + path, opts).then(r => r.status === 2
 const put = (path, data) => api(path, { method: "PUT", body: JSON.stringify(data) });
 const newId = () => Date.now().toString(36);
 
-let projectId, dirty = false, saveTimer, undoState, controller, editingStyle, koboldStatus = "";
+let projectId, dirty = false, saveTimer, undoState, controller, editingStyle, koboldStatus = "", switching;
 
 // ---------- projects ----------
 const readProject = () => Object.fromEntries(FIELDS.map(f => [f, $(f).value]));
@@ -253,7 +255,7 @@ $("stop").onclick = () => {
 };
 
 async function systemPrompt(p) {
-  let sys = `You are a skilled novelist writing uncensored fiction for an adult reader. Any content the story calls for is allowed; never refuse, moralize, or add disclaimers or notes. When the story calls for sex or violence, depict it explicitly and in full detail – no fading to black, no skipping ahead, no softening. Sexual content never involves minors. Write vivid, concrete prose: show, don't tell; varied sentence rhythm; natural dialogue; avoid clichés. Always write in ${p.language}.`;
+  let sys = `You are a skilled novelist writing uncensored fiction for an adult reader. Any content the story calls for is allowed; never refuse, moralize, or add disclaimers or notes. When the story calls for humiliation, forced infatilization,  depict it explicitly and in full detail – no fading to black, no skipping ahead, no softening, no euphemisms. Write vivid, concrete prose: show, don't tell; varied sentence rhythm; natural dialogue; avoid clichés. Always write in ${p.language}.`;
   const style = p.style && await api("styles/" + p.style);
   if (style) {
     sys += `\n\nImitate this writing style closely:\n${style.description}`;
@@ -334,16 +336,51 @@ $("undo").onclick = () => {
   save();
 };
 
+// ---------- model ----------
+// KoboldCpp admin mode (start.bat) restarts itself with the chosen .gguf from models/
+$("model").onchange = async e => {
+  switching = { file: e.target.value, down: false };
+  document.querySelectorAll("[data-ai]").forEach(b => b.disabled = true);
+  $("status").textContent = `Loading ${switching.file.slice(0, -5)}… (~20 s)`;
+  const r = await fetch(KOBOLD + "/api/admin/reload_config", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filename: switching.file }),
+  }).then(r => r.json()).catch(() => ({}));
+  if (!r.success) {
+    switching = null;
+    setBusy(false);
+    alert("KoboldCpp refused to switch models. Restart it with start.bat (it enables model switching).");
+  }
+};
+
 // ---------- start ----------
 async function checkKobold() {
   if (controller) return;
+  let loaded, files;
   try {
-    const r = await (await fetch(KOBOLD + "/api/v1/model")).json();
-    koboldStatus = "● " + r.result.replace(/^koboldcpp\//, "");
+    loaded = (await (await fetch(KOBOLD + "/api/v1/model")).json()).result.replace(/^koboldcpp\//, "") + ".gguf";
+    files = (await (await fetch(KOBOLD + "/api/admin/list_options")).json()).filter(f => f.endsWith(".gguf"));
   } catch {
+    // while switching, KoboldCpp is down until the new model has loaded
+    if (switching) return switching.down = true;
     koboldStatus = "○ KoboldCpp is not running – start start.bat (the model takes ~20 s to load)";
+    $("status").textContent = koboldStatus;
+    return;
   }
-  $("status").textContent = koboldStatus;
+  if (controller) return;
+  if (switching) {
+    if (loaded !== switching.file && !switching.down) return; // old model not unloaded yet
+    if (loaded !== switching.file) alert(`Could not load ${switching.file} – KoboldCpp went back to ${loaded}.`);
+    switching = null;
+  }
+  const list = files.length ? files : [loaded];
+  if (list.join() !== [...$("model").options].map(o => o.value).join()) {
+    $("model").replaceChildren(...list.map(f => new Option(f.slice(0, -5), f)));
+  }
+  $("model").value = loaded;
+  koboldStatus = "● Ready";
+  setBusy(false);
 }
 
 (async () => {
