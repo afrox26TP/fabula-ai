@@ -104,7 +104,8 @@ const api = (path, opts) => fetch("/api/" + path, opts).then(r => r.status === 2
 const put = (path, data) => api(path, { method: "PUT", body: JSON.stringify(data) });
 const newId = () => Date.now().toString(36);
 
-let projectId, dirty = false, saveTimer, undoState, controller, editingStyle, koboldStatus = "", switching;
+// stopped: the last generation was stopped by the user or failed
+let projectId, dirty = false, saveTimer, undoState, controller, stopped, editingStyle, koboldStatus = "", switching;
 
 // ---------- projects ----------
 const readProject = () => Object.fromEntries(FIELDS.map(f => [f, $(f).value]));
@@ -214,6 +215,7 @@ function setBusy(busy) {
 
 async function generate(messages, maxTokens, onText) {
   controller = new AbortController();
+  stopped = false;
   setBusy(true);
   let out = "";
   try {
@@ -240,6 +242,7 @@ async function generate(messages, maxTokens, onText) {
       }
     }
   } catch (e) {
+    stopped = true;
     if (e.name !== "AbortError") alert("Generation failed: " + e.message + "\n\nIs KoboldCpp running (start.bat)?");
   } finally {
     controller = null;
@@ -249,6 +252,7 @@ async function generate(messages, maxTokens, onText) {
 }
 
 $("stop").onclick = () => {
+  stopped = true;
   controller?.abort();
   fetch(KOBOLD + "/api/extra/abort", { method: "POST" });
 };
@@ -309,27 +313,42 @@ Create an outline for this story: a numbered list of chapters or scenes, each wi
 };
 
 $("continue").onclick = async () => {
-  const el = $("text");
+  const el = $("text"), length = +$("maxTokens").value || 1200;
   // a trailing space would make the model start on a word fragment; it writes its own leading space
-  const before = el.value.replace(/[ \t]+$/, "");
-  const out = await write(
-    async (p, system, max) => {
-      const only = "\nWrite only the story text – no titles, summaries or comments.";
-      if (!before.trim()) return `${storyInfo(p)}\n\nWrite the opening of the story.${p.instruction && `\nDirection: ${p.instruction}`}${only}`;
-      // the newest lines go in as the start of the model's own reply, so it carries the text on mid-thought instead of
-      // answering with a fresh scene; the direction sits right before them, as one ~10k tokens back gets ignored
-      const direction = p.instruction && `\nWhat must happen in this part (bring it about soon, right after the current moment): ${p.instruction}`;
-      const task = (earlier, cut) => `${storyInfo(p)}\n\n${earlier.trim() ? `Story so far${cut ? " (beginning cut off for space)" : ""}:\n"""\n${earlier}"""\n\n` : ""}Your reply below already holds the next lines of the story. Continue it seamlessly from exactly where it stops, picking up the thread of the last scene and thought. Everything written has already happened – never repeat or re-tell it; keep the story moving.${direction}${only}`;
-      const tail = await fitTail(before, system + task("x", true), max);
-      const split = tail.lastIndexOf("\n", tail.length - 1500) + 1;
-      return [task(tail.slice(0, split), tail.length < before.length), tail.slice(split)];
-    },
-    p => +p.maxTokens || 1200,
-    () => t => { el.value = before + t; el.scrollTop = el.scrollHeight; },
-  );
-  // drop a sentence cut off by the token limit or Stop; the next part would restart it anyway
-  const whole = out.match(/^[\s\S]*[.!?…]["“”»’]?(?=\s|$)/);
-  if (whole) { el.value = before + whole[0]; save(); }
+  let text = el.value.replace(/[ \t]+$/, "");
+  const only = "\nWrite only the story text – no titles, summaries or comments, and don't wrap the story up unless told to.";
+  // carryOn: the newest lines go in as the start of the model's own reply, so it carries the text on mid-thought instead of
+  // answering with a fresh scene. Where the text reads finished (a scene's or the story's end) the model ends that reply
+  // early or at once, so then it writes the next part as a new answer. (Banning the end token instead makes it write "The End" and a review.)
+  const prompt = (before, carryOn) => async (p, system, max) => {
+    if (!before.trim()) return `${storyInfo(p)}\n\nWrite the opening of the story.${p.instruction && `\nDirection: ${p.instruction}`}${only}`;
+    // the direction sits right before the newest lines, as one ~10k tokens back gets ignored
+    const direction = p.instruction && `\nWhat must happen in this part (bring it about soon, right after the current moment): ${p.instruction}`;
+    const ask = carryOn
+      ? "Your reply below already holds the next lines of the story. Continue it seamlessly from exactly where it stops, picking up the thread of the last scene and thought."
+      : "Write the next part of the story, starting right where it stops.";
+    const task = (earlier, cut) => `${storyInfo(p)}\n\n${earlier.trim() ? `Story so far${cut ? " (beginning cut off for space)" : ""}:\n"""\n${earlier}"""\n\n` : ""}${ask} Everything written has already happened – never repeat or re-tell it; keep the story moving.${direction}${only}`;
+    const tail = await fitTail(before, system + task("x", true), max);
+    const split = carryOn ? tail.lastIndexOf("\n", tail.length - 1500) + 1 : tail.length;
+    return [task(tail.slice(0, split), tail.length < before.length), tail.slice(split)];
+  };
+  const part = async carryOn => {
+    // after a finished sentence the model tends to end its reply there, so it gets a fresh paragraph to carry on in
+    const before = text, sep = carryOn ? (/[.!?…]["“”»’]?$/.test(before) ? "\n\n" : "") : (/\n$/.test(before) ? "" : "\n\n");
+    const out = await write(prompt(carryOn ? before + sep : before, carryOn), () => length, () => t => { el.value = before + sep + t; el.scrollTop = el.scrollHeight; });
+    // drop a sentence cut off by the token limit or Stop; the next part would restart it anyway
+    text = before + sep + (out.match(/^[\s\S]*[.!?…]["“”»’]?(?=\s|$)/)?.[0] ?? out);
+    return out;
+  };
+  const opening = !text.trim(), out = await part(true);
+  // fewer chars than Length's tokens (a token is 2–4 chars) means the model ended its reply by itself, well short
+  if (!opening && !stopped && out.length < length) {
+    const undo = undoState;
+    await part(false);
+    undoState = undo; // Undo takes back both
+  }
+  el.value = text;
+  save();
 };
 
 $("rewrite").onclick = () => {
