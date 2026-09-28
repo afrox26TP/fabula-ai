@@ -38,6 +38,8 @@ curl -L -o models/Broken-Tutu-24B-Unslop-v2.0-IQ4_XS.gguf https://huggingface.co
 curl -L -o models/WeirdCompound-v1.7-24B-IQ4_XS.gguf https://huggingface.co/mradermacher/WeirdCompound-v1.7-24b-i1-GGUF/resolve/main/WeirdCompound-v1.7-24b.i1-IQ4_XS.gguf
 ```
 
+In side-by-side runs of the same story, WeirdCompound wrote the cleanest and most coherent prose. Impish 12B wrote the richest descriptions but mixed up names and facts as the story grew. Czech output is noticeably weaker than English with all of them.
+
 Looking for more? Other GGUF models work too, as long as the file contains a chat template (KoboldCpp reads it from there). Sort the leaderboard by NSFW and Dark, not only W/10: models tagged *abliterated*, *heretic* or *uncensored* merely stop refusing and usually still write tamely (NSFW 2–4). Bigger models don't help either: the 30–120B MoE models score lower on NSFW than these fine-tunes.
 
 ## Run
@@ -45,3 +47,12 @@ Looking for more? Other GGUF models work too, as long as the file contains a cha
 Double-click `start.bat`. KoboldCpp loads the model (~20 s) and the app opens at http://localhost:5002.
 
 Projects and styles are saved as JSON files in `data/` (not tracked by git). To change the model loaded at startup, edit `MODEL` in `start.bat`.
+
+## How it writes
+
+- **Continue** writes in planned steps. Before each step the AI plans the next 2–3 beats (shown under the instruction box), then tells them as a scene. This keeps it from rushing through the whole plot at once or circling back to scenes it already wrote.
+- **What happens next** is optional. A new instruction is written right away, and later Continues keep working toward it. Leave it empty and the AI plans every step itself.
+- **Ideas** suggests three directions for the next part. Click one to write it.
+- **Retry** takes back the last Continue or Rewrite and does it again. **Undo** only takes it back.
+- **Length** is how much one Continue writes. The longer settings run several planned steps in a row.
+- **Story memory** holds notes on the characters, facts and events so far. The AI rewrites it after every ~1500 tokens of new text, and the planner reads it to avoid repeating itself. Edit it freely.

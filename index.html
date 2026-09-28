@@ -25,6 +25,10 @@
   button:disabled { opacity: .45; cursor: default; }
   .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
   .row > label { flex: 1; min-width: 120px; }
+  #ideas { display: flex; flex-wrap: wrap; gap: 6px; font-size: 13px; color: var(--muted); }
+  #ideas:empty, #plan:empty { display: none; }
+  #ideas button { flex: 1 1 240px; text-align: left; font-size: 13px; }
+  #plan { font-size: 12px; color: var(--muted); }
   dialog { width: min(820px, 95vw); padding: 20px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 10px; }
   dialog form { display: flex; flex-direction: column; gap: 10px; }
   @media (max-width: 820px) { main { grid-template-columns: 1fr; overflow: auto; } aside { border-right: 0; } #text { min-height: 70vh; } }
@@ -58,15 +62,37 @@
     </label>
     <button id="makeOutline" data-ai>Suggest outline</button>
     <label>Outline (edit it freely, the AI follows it)
-      <textarea id="outline" rows="14"></textarea>
+      <textarea id="outline" rows="10"></textarea>
     </label>
+    <label>Story memory (the AI keeps it up to date as the story grows, edit it freely)
+      <textarea id="memory" rows="10" placeholder="Characters, facts and events so far. Filled in automatically once the story gets longer."></textarea>
+    </label>
+    <input type="hidden" id="memoryUpTo">
+    <input type="hidden" id="usedInstruction">
+    <button id="updateMemory" data-ai>Update memory now</button>
   </aside>
   <section>
     <textarea id="text" aria-label="Text" placeholder="Your text appears here. Click “Continue”, or start writing yourself – the AI picks up where you stop."></textarea>
     <div class="row">
-      <label>Instruction (optional) <input id="instruction" placeholder="what should happen next / how to rewrite the selection"></label>
-      <label style="flex: 0 0 110px; min-width: 0">Length (tokens) <input id="maxTokens" type="number" min="100" max="4000" step="100"></label>
+      <label>What happens next, or how to rewrite the selection (optional – if empty, the AI plans each step itself)
+        <input id="instruction" placeholder="e.g. she finds the logbook with the last pages torn out">
+      </label>
+      <button id="suggest" data-ai title="Suggest three directions for the next part">Ideas</button>
+    </div>
+    <div id="ideas"></div>
+    <div id="plan"></div>
+    <div class="row">
+      <label style="flex: 0 0 190px; min-width: 0">Length
+        <select id="maxTokens">
+          <option value="300">Short (~200 words)</option>
+          <option value="600">Medium (~450 words)</option>
+          <option value="1000">Long (~750 words)</option>
+          <option value="2000">Very long (~1500 words)</option>
+          <option value="4000">Huge (~3000 words)</option>
+        </select>
+      </label>
       <button id="continue" class="primary" data-ai>Continue</button>
+      <button id="retry" data-ai title="Take back the last Continue or Rewrite and do it again">Retry</button>
       <button id="rewrite" data-ai>Rewrite selection</button>
       <button id="undo">Undo</button>
       <button id="stop" disabled>Stop</button>
@@ -94,22 +120,47 @@
 
 <script>
 const KOBOLD = "http://localhost:5001";
-// DRY penalizes re-writing earlier passages; KoboldCpp only scans the last 320 tokens unless dry_penalty_last_n is 0 (whole context)
-const SAMPLERS = { temperature: 0.9, min_p: 0.05, dry_multiplier: 0.8, dry_base: 1.75, dry_allowed_length: 2, dry_penalty_last_n: 0, dry_sequence_breakers: ["\n", ":", "\"", "*"] };
-const DEFAULTS = { name: "New text", genre: "", language: "English", style: "", premise: "", outline: "", instruction: "", maxTokens: "1200", text: "" };
+// stock phrases small models lean on; KoboldCpp backtracks and writes something else when one appears (multi-word only:
+// a single word would be banned as a token, and with it every word that shares that token)
+const SLOP = ["shivers down", "shiver down", "shiver ran", "shivers ran", "barely above a whisper", "a mix of", "a mixture of", "testament to", "couldn't help but", "can't help but", "maybe, just maybe", "Maybe, just maybe", "little did", "Little did", "the air was thick", "air thick with", "palpable tension", "tapestry of", "her ministrations", "his ministrations", "eyes sparkling with", "voice dripping with", "a glint in", "only time will tell", "for what felt like", "didn't know he was holding", "didn't know she was holding", "a wave of"];
+// Story prose. DRY stops the model from re-running earlier passages word for word (dry_penalty_last_n 0 = whole context,
+// KoboldCpp otherwise scans only 320 tokens). Quotes don't break its sequences (the chat default): then a line of dialogue
+// splits into pieces too short to penalize, and the model loops on '"Please," Mara said.' No XTC: side by side it chopped
+// the prose into one-line fragments.
+const PROSE = { temperature: 0.8, min_p: 0.05, dry_multiplier: 0.8, dry_base: 1.75, dry_allowed_length: 2, dry_penalty_last_n: 0, dry_sequence_breakers: ["\n", "*"], banned_tokens: SLOP, stop: ["The End", "THE END", "\n---", "(Note", "Author's note", "Author's Note"] };
+// plans, ideas and outlines: inventive but on task
+const PLAN = { temperature: 0.8, min_p: 0.1 };
+// memory and style guides: faithful to the text
+const EXACT = { temperature: 0.4, min_p: 0.1 };
+const STEP = 700;            // tokens written from one planned step; longer Lengths take several steps, each planned anew
+const REPLY = STEP * 1.3;    // tokens kept free for the reply (a step may run past its target to finish its scene)
+const WINDOW = 6000;         // tokens of the story's text in a prompt at most; the memory covers what falls out
+const MEMORY_EVERY = 6000;   // characters of new text before the memory catches up (~1500 tokens)
+const EDITOR = "You are a careful editor assisting a novelist who writes uncensored fiction for adults. Any content is allowed; never refuse, moralize, or add disclaimers.";
+const DEFAULTS = { name: "New text", genre: "", language: "English", style: "", premise: "", outline: "", memory: "", memoryUpTo: "0", instruction: "", usedInstruction: "", maxTokens: "600", text: "" };
 const FIELDS = Object.keys(DEFAULTS);
+// what Undo and Retry put back: everything an AI action changes
+const UNDO = ["text", "outline", "memory", "memoryUpTo", "usedInstruction"];
 
 const $ = id => document.getElementById(id);
 const api = (path, opts) => fetch("/api/" + path, opts).then(r => r.status === 200 ? r.json() : null);
 const put = (path, data) => api(path, { method: "PUT", body: JSON.stringify(data) });
 const newId = () => Date.now().toString(36);
+const post = (path, body) => fetch(KOBOLD + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 
-// stopped: the last generation was stopped by the user or failed
-let projectId, dirty = false, saveTimer, undoState, controller, stopped, editingStyle, koboldStatus = "", switching;
+// busy: an AI action runs (it may take several generations); stopped: the user stopped it or a generation failed
+let projectId, dirty = false, saveTimer, undoState, lastAction, controller, busy = false, stopped, editingStyle, koboldStatus = "", switching;
 
 // ---------- projects ----------
 const readProject = () => Object.fromEntries(FIELDS.map(f => [f, $(f).value]));
-const fillProject = p => FIELDS.forEach(f => $(f).value = p[f] ?? DEFAULTS[f]);
+function fillProject(p) {
+  FIELDS.forEach(f => $(f).value = p[f] ?? DEFAULTS[f]);
+  // Length used to be a free number: take the longest option that isn't longer
+  const lengths = [...$("maxTokens").options].map(o => +o.value);
+  $("maxTokens").value = lengths.filter(v => v <= +(p.maxTokens || DEFAULTS.maxTokens)).pop() ?? lengths[0];
+  $("ideas").replaceChildren();
+  $("plan").textContent = "";
+}
 
 function save() {
   dirty = true;
@@ -136,7 +187,7 @@ async function openProject(id) {
   await flush();
   projectId = id;
   fillProject(await api("projects/" + id));
-  undoState = null;
+  undoState = lastAction = null;
   await refreshProjects();
 }
 
@@ -144,6 +195,7 @@ async function newProject() {
   await flush();
   projectId = newId();
   fillProject(DEFAULTS);
+  undoState = lastAction = null;
   dirty = true;
   await flush();
 }
@@ -159,7 +211,7 @@ $("deleteProject").onclick = async () => {
   list.length ? openProject(list[0].id) : newProject();
 };
 document.querySelector("main").addEventListener("input", save);
-addEventListener("beforeunload", e => { if (dirty || controller) e.preventDefault(); });
+addEventListener("beforeunload", e => { if (dirty || busy) e.preventDefault(); });
 
 // ---------- styles ----------
 async function refreshStyles() {
@@ -194,36 +246,54 @@ $("deleteStyle").onclick = async () => {
   save();
   $("styleDialog").close();
 };
-$("analyzeStyle").onclick = async () => {
+$("analyzeStyle").onclick = () => {
   const samples = $("styleSamples").value.trim();
   if (!samples) return alert("Paste some sample text first.");
-  const prompt = `Analyze the writing style of the excerpts below and write a concise style guide (max 250 words, bullet points) that another writer could follow to imitate it. Cover: narrative perspective and tense, sentence length and rhythm, vocabulary and register, dialogue, density of description, pacing, tone and mood, and how intimate or explicit scenes are handled. Describe the style only – do not summarize the plot. Write the guide in English, as plain text without Markdown (use "-" for bullets).
+  run(() => generate([{ role: "user", content: `Analyze the writing style of the excerpts below and write a concise style guide (max 250 words, bullet points) that another writer could follow to imitate it. Cover: narrative perspective and tense, sentence length and rhythm, vocabulary and register, dialogue, density of description, pacing, tone and mood, and how intimate or explicit scenes are handled. Describe the style only – do not summarize the plot. Write the guide in English, as plain text without Markdown (use "-" for bullets).
 
 Excerpts:
 """
 ${samples.slice(0, 30000)}
-"""`;
-  await generate([{ role: "user", content: prompt }], 700, t => $("styleDescription").value = t);
+"""` }], 700, t => $("styleDescription").value = t, EXACT, "Analyzing the style…"));
 };
 
 // ---------- generation ----------
-function setBusy(busy) {
-  document.querySelectorAll("[data-ai]").forEach(b => b.disabled = busy);
-  $("stop").disabled = !busy;
-  $("status").textContent = busy ? "✍ Writing…" : koboldStatus;
+function setBusy(on) {
+  document.querySelectorAll("[data-ai]").forEach(b => b.disabled = on);
+  $("stop").disabled = !on;
+  if (!on) $("status").textContent = koboldStatus;
 }
 
-async function generate(messages, maxTokens, onText) {
-  controller = new AbortController();
+// one user action; retryable ones can be taken back with Undo and done again with Retry
+async function run(action, retryable) {
+  if (busy) return;
+  busy = true;
   stopped = false;
   setBusy(true);
-  let out = "";
+  if (retryable) {
+    undoState = Object.fromEntries(UNDO.map(f => [f, $(f).value]));
+    lastAction = action;
+  }
+  try {
+    await action();
+  } finally {
+    busy = false;
+    setBusy(false);
+    save();
+  }
+}
+
+// streams a chat reply into onText; finish is "stop" when the model ended the reply itself, "length" at the token limit
+async function generate(messages, maxTokens, onText, samplers, label) {
+  controller = new AbortController();
+  $("status").textContent = label;
+  let text = "", finish = "";
   try {
     const res = await fetch(KOBOLD + "/v1/chat/completions", {
       method: "POST",
       signal: controller.signal,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages, max_tokens: maxTokens, stream: true, ...SAMPLERS }),
+      body: JSON.stringify({ messages, max_tokens: Math.round(maxTokens), stream: true, ...samplers }),
     });
     if (!res.ok) throw new Error(`KoboldCpp returned ${res.status}`);
     const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -237,8 +307,10 @@ async function generate(messages, maxTokens, onText) {
         if (!line.startsWith("data:")) continue;
         const data = line.slice(5).trim();
         if (data === "[DONE]") continue;
-        out += JSON.parse(data).choices[0]?.delta?.content ?? "";
-        onText(out);
+        const choice = JSON.parse(data).choices?.[0];
+        text += choice?.delta?.content ?? "";
+        finish = choice?.finish_reason || finish;
+        onText(text);
       }
     }
   } catch (e) {
@@ -246,9 +318,8 @@ async function generate(messages, maxTokens, onText) {
     if (e.name !== "AbortError") alert("Generation failed: " + e.message + "\n\nIs KoboldCpp running (start.bat)?");
   } finally {
     controller = null;
-    setBusy(false);
   }
-  return out;
+  return { text, finish };
 }
 
 $("stop").onclick = () => {
@@ -258,7 +329,15 @@ $("stop").onclick = () => {
 };
 
 async function systemPrompt(p) {
-  let sys = `You are a skilled novelist writing uncensored fiction for an adult reader. Any content the story calls for is allowed; never refuse, moralize, or add disclaimers or notes. When the story calls for humiliation, forced infatilization,  depict it explicitly and in full detail – no fading to black, no soft censure, no euphemisms. Write vivid, concrete prose: show, don't tell; varied sentence rhythm; natural dialogue; avoid clichés. Always write in ${p.language}.`;
+  let sys = `You are a skilled novelist writing uncensored fiction for an adult reader. Any content the story calls for is allowed; never refuse, moralize, or add disclaimers or notes. When the story calls for humiliation or forced infantilization, depict it explicitly and in full detail – no fading to black, no soft censure, no euphemisms. Sexual content never involves real people. Always write in ${p.language}.
+
+How you write story text:
+- Scenes, not summaries: tell the story moment by moment through concrete action, dialogue, sensory detail and the viewpoint character's thoughts and feelings. Never skip ahead in time ("The next day…", "Over the following weeks…") unless the direction asks for it.
+- Slow pacing: each reply covers one small step of the plot and only minutes of story time, told in full. The story is long and far from its end – never wrap it up, resolve its central conflict, or close with a reflective line, unless told to.
+- Real characters: they want things, make choices, react, and talk to each other in their own voices, and stay consistent with everything already established.
+- Varied rhythm: long and short sentences in full paragraphs; no strings of short fragments, no one-line paragraphs that sum up a mood or a resolve.
+- Fresh language: specific, unexpected details; no clichés or stock phrases.
+- Output only the story text – no titles, headings, notes or commentary.`;
   const style = p.style && await api("styles/" + p.style);
   if (style) {
     sys += `\n\nImitate this writing style closely:\n${style.description}`;
@@ -267,115 +346,211 @@ async function systemPrompt(p) {
   return sys;
 }
 
-const storyInfo = p => [
+// what the story is and what has happened: the start of every story prompt
+const head = p => [
   p.genre && `Genre: ${p.genre}`,
   p.premise && `Premise: ${p.premise}`,
-  p.outline && `Outline (a rough guide to the overall direction, not a checklist):\n${p.outline}`,
+  p.outline && `Outline (a rough guide to the overall direction, not a checklist – the story moves through it slowly):\n${p.outline}`,
+  p.memory.trim() && `Story memory (notes on the characters and what has happened so far):\n${p.memory.trim()}`,
 ].filter(Boolean).join("\n\n");
 
-// the end of the story that fits the context next to the rest of the prompt and the reply
-// (Czech takes ~2 chars per token, English ~4, so a fixed char budget overflows and KoboldCpp then cuts the prompt's start)
-async function fitTail(text, rest, maxTokens) {
-  const count = prompt => fetch(KOBOLD + "/api/extra/tokencount", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ prompt }) }).then(r => r.json()).then(r => r.value);
+// the story's text for a prompt; the planner and Ideas see all of it, a carried-on reply holds the recent part itself
+const storyPart = (w, withRecent) => (w.earlier || withRecent) &&
+  `Story so far${w.cut ? " (its beginning is cut off here – the story memory covers it)" : ""}:\n"""\n${w.earlier}${withRecent ? w.recent : ""}\n"""`;
+
+const words = tokens => Math.round(tokens * 0.07) * 10;
+
+// The newest part of the story that fits in a prompt: at most WINDOW tokens (a small model writes better from a focused
+// prompt), and no more than the context leaves next to the rest of the prompt and the reply (Czech takes ~2 chars per token,
+// English ~4, so it is counted, not guessed). Its start moves in 4000-char steps, so prompts for the planner, the writer and
+// the next Continue begin alike and KoboldCpp reuses what it already read instead of reading the whole story again.
+// recent: the last paragraphs (~1500 chars), which a carried-on reply holds as its own beginning.
+async function storyWindow(text, rest) {
+  let start = 0;
   try {
+    const count = async prompt => (await (await post("/api/extra/tokencount", { prompt })).json()).value;
     const ctx = (await (await fetch(KOBOLD + "/api/extra/true_max_context_length")).json()).value;
-    const room = ctx - maxTokens - await count(rest) - 50; // 50: chat template tags
-    const tail = text.slice(Math.max(0, text.length - room * 6)); // no text packs more than ~6 chars into a token
-    const n = await count(tail);
-    return n <= room ? tail : tail.slice(Math.ceil(tail.length * (1 - room / n * 0.95)));
+    const room = Math.min(WINDOW, ctx - REPLY - await count(rest) - 450); // 450: the task and the chat template's tags
+    start = Math.max(0, text.length - room * 6); // no text packs more than ~6 chars into a token
+    const n = await count(text.slice(start));
+    if (n > room) start = text.length - Math.floor((text.length - start) * room / n * 0.95);
+    if (start > 0) start = text.indexOf("\n", Math.ceil(start / 4000) * 4000) + 1 || start;
   } catch {
-    return text; // KoboldCpp is down; generate() reports it
+    // KoboldCpp is down; generate() reports it
+  }
+  const split = Math.max(start, text.lastIndexOf("\n", text.length - 1500) + 1);
+  return { earlier: text.slice(start, split), recent: text.slice(split), cut: start > 0 };
+}
+
+// Story memory: notes on characters, facts and events, rewritten by the AI once enough new text has piled up (all of it
+// when forced). The planner reads it to know what already happened, so the story doesn't circle back to the same situations.
+async function updateMemory(force) {
+  const text = $("text").value;
+  // an emptied memory covers nothing, so it is rebuilt from the start
+  let upto = $("memory").value.trim() ? Math.min(+$("memoryUpTo").value || 0, text.length) : 0;
+  if (text.length - upto < (force ? 1 : MEMORY_EVERY)) return;
+  const p = readProject();
+  // a long unsummarized stretch (an old story, pasted text) goes in even pieces of up to ~24000 chars
+  const pieces = Math.ceil((text.length - upto) / 24000), size = (text.length - upto) / pieces;
+  for (let i = 1; i <= pieces && !stopped; i++) {
+    let end = i === pieces ? text.length : Math.round(upto + size);
+    if (end < text.length) end = text.lastIndexOf("\n", end) > upto ? text.lastIndexOf("\n", end) : end;
+    const notes = $("memory").value.trim();
+    const { text: out } = await generate([{ role: "system", content: EDITOR }, { role: "user", content: `${notes ? `Notes on a story so far:\n${notes}\n\nThe story continues:` : "The beginning of a story:"}
+"""
+${text.slice(upto, end)}
+"""
+
+${notes ? "Update the notes so they cover the new part too." : "Write notes on it."} They let a writer continue the story without rereading it. Plain text, "-" bullets, these four sections, in ${p.language}:
+Characters: one line each – name, who they are, what they want, how they relate to the others.
+Facts: places, objects, rules, secrets and promises that may matter later.
+Events: one line per important event, in order. Keep all earlier events (condense the oldest if needed) and add the new ones.
+Now: where things stand at the end – who is where, what is unresolved, what is about to happen.
+Keep the notes under 400 words. Output only the notes.` }], 900, t => $("memory").value = t, EXACT, pieces > 1 ? `Updating the story memory (${i}/${pieces})…` : "Updating the story memory…");
+    if (stopped || !out.trim()) {
+      $("memory").value = notes;
+      break;
+    }
+    $("memory").value = out.replace(/\*\*|^#+ */gm, "").trim(); // models add Markdown anyway
+    $("memoryUpTo").value = upto = end;
   }
 }
 
-async function write(buildPrompt, maxTokens, onText) {
-  const p = readProject(), max = maxTokens(p);
-  undoState = { text: p.text, outline: p.outline };
-  const system = await systemPrompt(p);
-  // buildPrompt gives the user message, or [user message, start of the reply for the model to carry on]
-  const [user, prefill] = [].concat(await buildPrompt(p, system, max));
-  const messages = [{ role: "system", content: system }, { role: "user", content: user }];
-  if (prefill) messages.push({ role: "assistant", content: prefill });
-  const out = await generate(messages, max, onText(p));
-  save();
-  return out;
+// The next stretch of the story, planned before it is written: a plan sized to the stretch keeps the model from rushing
+// through the plot (too big) or from padding a small step with events of its own (too small), and the planner checks it
+// against what already happened. The reply starts with "Plan:" so the model plans instead of writing the story on.
+async function planStep(p, system, w, direction, size) {
+  const task = `${direction ? `The author's direction for this stretch of the story (it may already be under way – if it has happened, carry on from its aftermath): ${direction}\n\n` : ""}Plan the next stretch of the story (~${words(size)} words), starting from the situation at its very last line: ${size > 400 ? "2–3 beats" : "1–2 beats"}, one short sentence each, in order. Each beat is an event – something a character does, says or finds out that changes the situation, not a mere reaction or thought – and small enough to be told slowly and in full, with dialogue and detail; together they cover minutes of story time, not hours or days. Move the story forward – a complication, a revelation, a decision, a new person or place, a rise in tension. Everything in the story so far has already happened, the last lines included: never plan any of it again, and don't circle back to a kind of scene it already had (the same threat, argument or escape once more) – take the story somewhere new. Don't resolve the central conflict. Write the plan in ${p.language}, as plain sentences, not story prose.`;
+  const { text } = await generate([{ role: "system", content: system }, { role: "user", content: [head(p), storyPart(w, true), task].filter(Boolean).join("\n\n") }, { role: "assistant", content: "Plan:" }],
+    120, t => $("plan").textContent = "Planning: " + t, PLAN, "Planning the next step…");
+  // a list becomes sentences; past three sentences the model has left the plan for the story itself
+  const plan = text.replace(/\*\*|\(\d+\)|(?<=^|\s)\d[.)](?=\s)/g, "").replace(/\s*\n\s*[-*•]?\s*/g, " ").replace(/ +/g, " ").trim();
+  return plan.match(/^(?:[^.!?…]+[.!?…]+["”’]?\s*){1,3}/)?.[0].trim() ?? plan;
 }
+
+// writes one step into the text: carryOn gives the model the newest lines as the start of its own reply, so it carries the
+// text on mid-thought instead of answering with a fresh scene
+async function writeStep(p, system, text, w, step, size, carryOn) {
+  const el = $("text"), opening = !text.trim();
+  // after a finished sentence a carried-on reply tends to end right there, so it gets a fresh paragraph to carry on in
+  const sep = opening ? "" : carryOn ? (/[.!?…]["“”»’]?$/.test(text) ? "\n\n" : "") : (/\n$/.test(text) ? "" : "\n\n");
+  const messages = [{ role: "system", content: system }];
+  if (opening) {
+    messages.push({ role: "user", content: [head(p), `Write the opening scene of the story, about ${words(size)} words. Start inside a concrete moment and introduce the main character through what they do, say and notice.${step ? `\nWhat happens in it: ${step}` : ""}`].filter(Boolean).join("\n\n") });
+  } else {
+    const task = [
+      carryOn ? "Your reply below already holds the latest lines of the story. Continue it seamlessly from exactly where it stops." : "Write the next part of the story, starting right where it stops.",
+      step && `What happens next (write exactly this, in order, and stop when it is done – add no events of your own): ${step}`,
+      `Tell it in full, as a scene, in about ${words(size)} words. Everything above has already happened – never repeat or re-tell it. Keep the voice, tense and point of view of the story so far.`,
+    ].filter(Boolean).join("\n");
+    messages.push({ role: "user", content: [head(p), storyPart(w, !carryOn), task].filter(Boolean).join("\n\n") });
+    if (carryOn) messages.push({ role: "assistant", content: w.recent + sep });
+  }
+  const { text: out, finish } = await generate(messages, size * 1.3, t => { el.value = text + sep + t; el.scrollTop = el.scrollHeight; }, PROSE, "✍ Writing…");
+  // drop a sentence cut off by the token limit or Stop; the next step would restart it anyway
+  const kept = finish === "stop" ? out.trimEnd() : out.match(/^[\s\S]*[.!?…]["“”»’]?(?=\s|$)/)?.[0] ?? out;
+  el.value = text + sep + kept;
+  return { out: kept, finish };
+}
+
+// Continue: writes Length in steps of up to STEP tokens. Each step is planned first, unless the user just gave a new
+// instruction: that is written right away and afterwards is the goal the planned steps work toward.
+async function continueStory() {
+  const el = $("text"), target = +$("maxTokens").value, instruction = $("instruction").value.trim();
+  const perToken = $("language").value === "Czech" ? 3 : 4; // chars, roughly
+  let step = instruction !== $("usedInstruction").value ? instruction : "", carryOn = true, written = 0;
+  $("usedInstruction").value = instruction;
+  for (let i = 0; i < 12 && !stopped; i++) {
+    const size = Math.min(STEP, target - written);
+    if (i && size < 150) break;
+    await updateMemory(false);
+    if (stopped) break;
+    const p = readProject(), system = await systemPrompt(p), text = el.value.replace(/[ \t]+$/, "");
+    const w = await storyWindow(text, system + head(p));
+    if (!step && text.trim()) step = await planStep(p, system, w, instruction, size);
+    if (stopped) break;
+    $("plan").textContent = step && "Next: " + step;
+    const r = await writeStep(p, system, text, w, step, size, carryOn);
+    // the model read the scene as finished and ended its carried-on reply at once: write the step as a fresh answer
+    if (carryOn && text.trim() && r.finish === "stop" && r.out.trim().length < 80) {
+      el.value = text;
+      carryOn = false;
+      continue;
+    }
+    written += r.out.length / perToken;
+    carryOn = true;
+    if (r.finish !== "length") step = ""; // the step is done; a step cut off by the limit goes on in the next one
+  }
+}
+
+$("continue").onclick = () => run(continueStory, true);
+
+$("retry").onclick = () => {
+  if (!undoState || !lastAction) return;
+  UNDO.forEach(f => $(f).value = undoState[f]);
+  run(lastAction, true);
+};
+
+$("undo").onclick = () => {
+  if (!undoState || busy) return;
+  UNDO.forEach(f => $(f).value = undoState[f]);
+  undoState = null;
+  save();
+};
+
+$("suggest").onclick = () => run(async () => {
+  await updateMemory(false);
+  if (stopped) return;
+  const p = readProject(), system = await systemPrompt(p), text = p.text.replace(/[ \t]+$/, "");
+  const task = `${p.instruction.trim() ? `Keep in line with the author's direction: ${p.instruction.trim()}\n\n` : ""}Suggest 3 clearly different ideas for what could happen next${text.trim() ? ", directly after the story's last line" : " – for the opening scene"}. Each is 1–2 sentences about a concrete development – a complication, a revelation, a decision, a new person or place – that builds on what has been established and doesn't repeat anything that already happened. Make one of them surprising. Output only a numbered list (1., 2., 3.), in ${p.language}.`;
+  const story = text.trim() && storyPart(await storyWindow(text, system + head(p)), true);
+  const { text: out } = await generate([{ role: "system", content: system }, { role: "user", content: [head(p), story, task].filter(Boolean).join("\n\n") }],
+    400, t => $("ideas").textContent = t, PLAN, "Thinking up ideas…");
+  const ideas = out.replace(/\*\*/g, "").split("\n").map(l => l.match(/^\s*\d+[.)]\s*(.+)/)?.[1].trim()).filter(Boolean);
+  $("ideas").replaceChildren(...ideas.map(idea => {
+    const b = document.createElement("button");
+    b.textContent = idea;
+    b.title = "Write this next";
+    b.dataset.ai = "";
+    b.onclick = () => {
+      $("instruction").value = idea;
+      $("ideas").replaceChildren();
+      run(continueStory, true);
+    };
+    return b;
+  }));
+});
+
+$("updateMemory").onclick = () => run(() => updateMemory(true), true);
 
 $("makeOutline").onclick = () => {
   if (!$("premise").value.trim()) return alert("First describe what the story should be about.");
-  write(
-    p => `${storyInfo({ ...p, outline: "" })}
+  run(async () => {
+    const p = readProject();
+    await generate([{ role: "system", content: await systemPrompt(p) }, { role: "user", content: `${head({ ...p, outline: "", memory: "" })}
 
-Create an outline for this story: a numbered list of chapters or scenes, each with 1–3 sentences on what happens. ${p.instruction && `Direction: ${p.instruction}. `}Output only the outline as plain text without Markdown, in ${p.language}.`,
-    () => 1500,
-    () => t => $("outline").value = t,
-  );
-};
-
-$("continue").onclick = async () => {
-  const el = $("text"), length = +$("maxTokens").value || 1200;
-  // a trailing space would make the model start on a word fragment; it writes its own leading space
-  let text = el.value.replace(/[ \t]+$/, "");
-  const only = "\nWrite only the story text – no titles, summaries or comments, and don't wrap the story up unless told to.";
-  // carryOn: the newest lines go in as the start of the model's own reply, so it carries the text on mid-thought instead of
-  // answering with a fresh scene. Where the text reads finished (a scene's or the story's end) the model ends that reply
-  // early or at once, so then it writes the next part as a new answer. (Banning the end token instead makes it write "The End" and a review.)
-  const prompt = (before, carryOn) => async (p, system, max) => {
-    if (!before.trim()) return `${storyInfo(p)}\n\nWrite the opening of the story.${p.instruction && `\nDirection: ${p.instruction}`}${only}`;
-    // the direction sits right before the newest lines, as one ~10k tokens back gets ignored
-    const direction = p.instruction && `\nWhat must happen in this part (bring it about soon, right after the current moment): ${p.instruction}`;
-    const ask = carryOn
-      ? "Your reply below already holds the next lines of the story. Continue it seamlessly from exactly where it stops, picking up the thread of the last scene and thought."
-      : "Write the next part of the story, starting right where it stops.";
-    const task = (earlier, cut) => `${storyInfo(p)}\n\n${earlier.trim() ? `Story so far${cut ? " (beginning cut off for space)" : ""}:\n"""\n${earlier}"""\n\n` : ""}${ask} Everything written has already happened – never repeat or re-tell it; keep the story moving.${direction}${only}`;
-    const tail = await fitTail(before, system + task("x", true), max);
-    const split = carryOn ? tail.lastIndexOf("\n", tail.length - 1500) + 1 : tail.length;
-    return [task(tail.slice(0, split), tail.length < before.length), tail.slice(split)];
-  };
-  const part = async carryOn => {
-    // after a finished sentence the model tends to end its reply there, so it gets a fresh paragraph to carry on in
-    const before = text, sep = carryOn ? (/[.!?…]["“”»’]?$/.test(before) ? "\n\n" : "") : (/\n$/.test(before) ? "" : "\n\n");
-    const out = await write(prompt(carryOn ? before + sep : before, carryOn), () => length, () => t => { el.value = before + sep + t; el.scrollTop = el.scrollHeight; });
-    // drop a sentence cut off by the token limit or Stop; the next part would restart it anyway
-    text = before + sep + (out.match(/^[\s\S]*[.!?…]["“”»’]?(?=\s|$)/)?.[0] ?? out);
-    return out;
-  };
-  const opening = !text.trim(), out = await part(true);
-  // fewer chars than Length's tokens (a token is 2–4 chars) means the model ended its reply by itself, well short
-  if (!opening && !stopped && out.length < length) {
-    const undo = undoState;
-    await part(false);
-    undoState = undo; // Undo takes back both
-  }
-  el.value = text;
-  save();
+Create an outline for this story: a numbered list of chapters or scenes, each with 1–3 sentences on what happens. ${p.instruction && `Direction: ${p.instruction}. `}Output only the outline as plain text without Markdown, in ${p.language}.` }],
+      1500, t => $("outline").value = t, PLAN, "Outlining…");
+  }, true);
 };
 
 $("rewrite").onclick = () => {
   const el = $("text"), a = el.selectionStart, b = el.selectionEnd;
   if (a === b) return alert("First select the passage you want to rewrite.");
-  write(
-    p => `${storyInfo(p)}
+  run(async () => {
+    const p = readProject(), passage = p.text.slice(a, b);
+    await generate([{ role: "system", content: await systemPrompt(p) }, { role: "user", content: `${head(p)}
 
-${a > 0 ? `Text right before the passage (context only):\n"""\n${p.text.slice(Math.max(0, a - 4000), a)}\n"""\n\n` : ""}Passage to rewrite (${p.text.slice(a, b).split(/\s+/).filter(Boolean).length} words):
+${a > 0 ? `Text right before the passage (context only):\n"""\n${p.text.slice(Math.max(0, a - 4000), a)}\n"""\n\n` : ""}Passage to rewrite (${passage.split(/\s+/).filter(Boolean).length} words):
 """
-${p.text.slice(a, b)}
+${passage}
 """
 
 Rewrite the passage. ${p.instruction ? `Instruction: ${p.instruction}` : "Make it more vivid and detailed."}
 Keep roughly the same length and number of paragraphs unless the instruction says otherwise. Rewrite only this passage – do not continue the story past its end.
-Output only the rewritten passage, no comments.`,
-    p => Math.max(+p.maxTokens || 1200, Math.ceil((b - a) / 2)),
-    p => t => el.value = p.text.slice(0, a) + t + p.text.slice(b),
-  );
-};
-
-$("undo").onclick = () => {
-  if (!undoState) return;
-  $("text").value = undoState.text;
-  $("outline").value = undoState.outline;
-  undoState = null;
-  save();
+Output only the rewritten passage, no comments.` }],
+      Math.max(+p.maxTokens, (b - a) / 2), t => el.value = p.text.slice(0, a) + t + p.text.slice(b), PROSE, "✍ Rewriting…");
+  }, true);
 };
 
 // ---------- model ----------
@@ -384,11 +559,7 @@ $("model").onchange = async e => {
   switching = { file: e.target.value, down: false };
   document.querySelectorAll("[data-ai]").forEach(b => b.disabled = true);
   $("status").textContent = `Loading ${switching.file.slice(0, -5)}… (~20 s)`;
-  const r = await fetch(KOBOLD + "/api/admin/reload_config", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ filename: switching.file }),
-  }).then(r => r.json()).catch(() => ({}));
+  const r = await post("/api/admin/reload_config", { filename: switching.file }).then(r => r.json()).catch(() => ({}));
   if (!r.success) {
     switching = null;
     setBusy(false);
@@ -398,7 +569,7 @@ $("model").onchange = async e => {
 
 // ---------- start ----------
 async function checkKobold() {
-  if (controller) return;
+  if (busy) return;
   let loaded, files;
   try {
     loaded = (await (await fetch(KOBOLD + "/api/v1/model")).json()).result.replace(/^koboldcpp\//, "") + ".gguf";
@@ -410,7 +581,7 @@ async function checkKobold() {
     $("status").textContent = koboldStatus;
     return;
   }
-  if (controller) return;
+  if (busy) return;
   if (switching) {
     if (loaded !== switching.file && !switching.down) return; // old model not unloaded yet
     if (loaded !== switching.file) alert(`Could not load ${switching.file} – KoboldCpp went back to ${loaded}.`);
